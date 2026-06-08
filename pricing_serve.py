@@ -1,116 +1,127 @@
+import requests
 from mcp.server.fastmcp import FastMCP
 
 # 初始化 FastMCP 服务器
-# 这里的名称会显示在 AI 客户端的工具列表中
-mcp = FastMCP("TransportPricingServer")
+mcp = FastMCP("SmartTransportPricingServer")
+
+# ==========================================
+# 百度地图 API 配置
+# ==========================================
+BAIDU_AK = "lZ2Uv8MTsu9mV2KDHSIcLeBhsi8krMvu"  # 请替换为你的真实AK
+
+def get_location_info(address: str):
+    """
+    调用百度地图API,获取地址的经纬度和所属城市
+    """
+    # 1. 正向地理编码：地址 -> 经纬度
+    geo_url = f"https://api.map.baidu.com/geocoding/v3/?address={address}&output=json&ak={BAIDU_AK}"
+    geo_res = requests.get(geo_url).json()
+    
+    if geo_res.get("status") != 0:
+        raise ValueError(f"无法解析地址：{address},百度API返回状态码:{geo_res.get('status')}")
+        
+    location = geo_res["result"]["location"]
+    lat, lng = location["lat"], location["lng"]
+    
+    # 2. 逆地理编码：经纬度 -> 详细地址信息（提取城市名）
+    rev_url = f"https://api.map.baidu.com/reverse_geocoding/v3/?location={lat},{lng}&output=json&ak={BAIDU_AK}"
+    rev_res = requests.get(rev_url).json()
+    
+    if rev_res.get("status") != 0:
+        raise ValueError(f"无法获取城市信息：{address}")
+        
+    city = rev_res["result"]["addressComponent"]["city"]
+    
+    return {"lat": lat, "lng": lng, "city": city}
+
+def get_driving_distance(lat1, lng1, lat2, lng2) -> float:
+    """
+    调用百度地图轻量级驾车路线规划API,获取距离（公里）
+    """
+    # 注意：百度API要求的坐标格式是 "纬度,经度" (lat,lng)
+    direction_url = f"https://api.map.baidu.com/directionlite/v1/driving?origin={lat1},{lng1}&destination={lat2},{lng2}&ak={BAIDU_AK}"
+    res = requests.get(direction_url).json()
+    
+    if res.get("status") != 0:
+        raise ValueError(f"路线规划失败,百度API返回状态码:{res.get('status')}")
+        
+    # 获取第一条推荐路线的距离（单位：米）
+    distance_meters = res["result"]["routes"][0]["distance"]
+    
+    # 转换为公里并保留两位小数
+    return round(distance_meters / 1000.0, 2)
+
+# ==========================================
+# MCP 工具定义
+# ==========================================
 
 @mcp.tool()
-def calculate_single_trip(
-    distance: float, 
-    is_out_of_city: bool, 
+def smart_calculate_single_trip(
+    origin: str, 
+    destination: str, 
     base_price: float, 
     mileage_rate: float, 
     out_of_city_base_price: float = 0.0
 ) -> str:
     """
-    计算单程报价。
-    :param distance: 行程里程 (KM)
-    :param is_out_of_city: 终点是否在市外 (True/False)
+    智能计算单程报价（自动调用百度地图查询里程和判断跨市）。
+    :param origin: 出发地名称 (如 "杭州市西湖区黄龙体育中心")
+    :param destination: 目的地名称 (如 "上海市浦东机场")
     :param base_price: 市内起步价
     :param mileage_rate: 里程费单价 (元/KM)
     :param out_of_city_base_price: 市外起步价 (跨市时使用)
     """
-    if distance > 100 and is_out_of_city:
-        price = out_of_city_base_price + (distance - 100) * mileage_rate
-        return f"【单程-跨市长途】报价: {price:.2f} 元 (计算: 市外起步价 + 超出100km部分的里程费)"
-    elif distance > 20:
-        price = base_price + (distance - 20) * mileage_rate
-        return f"【单程-普通】报价: {price:.2f} 元 (计算: 起步价 + 超出20km部分的里程费)"
-    else:
-        price = base_price
-        return f"【单程-短途】报价: {price:.2f} 元 (计算: 仅收起步价，里程<=20KM)"
+    
+    try:
+        # 1. 获取起点和终点的信息
+        start_info = get_location_info(origin)
+        end_info = get_location_info(destination)
+        
+        # 2. 判断是否跨市
+        is_out_of_city = (start_info["city"] != end_info["city"])
+        
+        # 3. 计算实际驾车里程
+        distance = get_driving_distance(
+            start_info["lat"], start_info["lng"], 
+            end_info["lat"], end_info["lng"]
+        )
+        
+        # 4. 执行报价逻辑
+        price = 0.0
+        calc_detail = ""
+        trip_type = ""
+        
+        if distance > 100 and is_out_of_city:
+            price = out_of_city_base_price + (distance - 100) * mileage_rate
+            trip_type = "单程-跨市长途"
+            calc_detail = f"市外起步价({out_of_city_base_price}) + 超出100km部分({distance-100:.2f}km) * 里程费({mileage_rate})"
+        elif distance > 20:
+            price = base_price + (distance - 20) * mileage_rate
+            trip_type = "单程-普通"
+            calc_detail = f"市内起步价({base_price}) + 超出20km部分({distance-20:.2f}km) * 里程费({mileage_rate})"
+        else:
+            price = base_price
+            trip_type = "单程-短途"
+            calc_detail = f"仅收起步价({base_price})，里程<=20KM"
+            
+        # 5. 组装返回给 AI 的结果
+        result = (
+            f"📍 行程解析成功：\n"
+            f"- 起点：{origin} ({start_info['city']})\n"
+            f"- 终点：{destination} ({end_info['city']})\n"
+            f"- 实际驾车里程：{distance} KM\n"
+            f"- 是否跨市：{'是' if is_out_of_city else '否'}\n"
+            f"------------------------\n"
+            f"💰 报价结果：\n"
+            f"- 匹配类型：【{trip_type}】\n"
+            f"- 最终报价：{price:.2f} 元\n"
+            f"- 计算公式：{calc_detail}"
+        )
+        return result
 
-@mcp.tool()
-def calculate_sameday_return(
-    time_hours: float,
-    distance: float,
-    is_out_of_city: bool,
-    base_price: float,
-    price_4h: float,
-    price_8h: float,
-    overtime_fee: float = 0.0,
-    overdistance_fee: float = 0.0
-) -> str:
-    """
-    计算当天往返报价。
-    :param time_hours: 用车时间(小时)
-    :param distance: 总里程(KM)
-    :param is_out_of_city: 终点是否在市外
-    :param base_price: 基础起步价
-    :param price_4h: 4小时包车基本价
-    :param price_8h: 8小时包车基本价
-    :param overtime_fee: 超时费总额 (若无则填0)
-    :param overdistance_fee: 超里程费总额 (若无则填0)
-    """
-    if time_hours <= 4 and distance <= 50:
-        return f"【当天往返-短途短时】报价: {base_price:.2f} 元 (计算: 仅收起步价)"
-    
-    if distance > 100 and is_out_of_city:
-        price = price_8h + overtime_fee + overdistance_fee
-        return f"【当天往返-跨市长途】报价: {price:.2f} 元 (计算: 8小时基本价 + 超时费 + 超里程费)"
-    
-    # 超时或超里程的情况，取 4小时套餐和8小时套餐的最小值
-    cost_4h_plan = price_4h + overtime_fee + overdistance_fee
-    cost_8h_plan = price_8h + overtime_fee + overdistance_fee
-    
-    if cost_4h_plan <= cost_8h_plan:
-        return f"【当天往返-超时/超里程】报价: {cost_4h_plan:.2f} 元 (计算: 采用4小时套餐更划算)"
-    else:
-        return f"【当天往返-超时/超里程】报价: {cost_8h_plan:.2f} 元 (计算: 采用8小时套餐更划算)"
-
-@mcp.tool()
-def calculate_charter_daily(
-    days: int,
-    price_8h_per_day: float,
-    total_overtime_fee: float = 0.0,
-    total_overdistance_fee: float = 0.0
-) -> str:
-    """
-    计算包天报价（支持单日或多日）。
-    :param days: 包天总天数
-    :param price_8h_per_day: 每天的8小时基本价
-    :param total_overtime_fee: 所有天数累加的超时费
-    :param total_overdistance_fee: 所有天数累加的超里程费
-    """
-    base_total = days * price_8h_per_day
-    total_price = base_total + total_overtime_fee + total_overdistance_fee
-    return f"【包天】报价: {total_price:.2f} 元 (计算: {days}天基本价 + 总超时费 + 总超里程费)"
-
-@mcp.tool()
-def calculate_nextday_return(
-    charter_daily_price: float,
-    waiting_days: int,
-    driving_days: int,
-    single_trip_total: float,
-    total_overtime_overdistance: float = 0.0
-) -> str:
-    """
-    计算隔天往返报价。逻辑：min(∑包天一天, ∑单程)。
-    :param charter_daily_price: 包天一天的基本价
-    :param waiting_days: 空等待的天数（包天计算时需计入基本价）
-    :param driving_days: 实际行车的天数
-    :param single_trip_total: 如果按“两次单程”计算的总价
-    :param total_overtime_overdistance: 包天方案中产生的超时/超里程费
-    """
-    # 计算包天方案总价：(行车天数 + 等待天数) * 日基本价 + 额外费用
-    total_charter_days = driving_days + waiting_days
-    charter_plan_price = (total_charter_days * charter_daily_price) + total_overtime_overdistance
-    
-    if charter_plan_price <= single_trip_total:
-        return f"【隔天往返】报价: {charter_plan_price:.2f} 元 (计算: 按包天计算更划算，包含{waiting_days}天空等待期)"
-    else:
-        return f"【隔天往返】报价: {single_trip_total:.2f} 元 (计算: 按多次单程累加计算更划算)"
+    except Exception as e:
+        # 如果网络请求失败或地址找不到，把错误信息返回给 AI
+        return f"调用地图数据失败，原因：{str(e)}。请让用户提供更准确的地址，或手动提供里程数。"
 
 if __name__ == "__main__":
-    # 启动 MCP 服务器
     mcp.run()
