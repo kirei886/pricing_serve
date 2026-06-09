@@ -1,5 +1,9 @@
+import os
 import requests
+from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
+
+load_dotenv()
 
 # 初始化 FastMCP 服务器
 mcp = FastMCP("SmartTransportPricingServer")
@@ -7,7 +11,9 @@ mcp = FastMCP("SmartTransportPricingServer")
 # ==========================================
 # 百度地图 API 配置
 # ==========================================
-BAIDU_AK = "lZ2Uv8MTsu9mV2KDHSIcLeBhsi8krMvu"  # 请替换为你的真实AK
+BAIDU_AK = os.getenv("BAIDU_AK")
+if not BAIDU_AK:
+    raise RuntimeError("BAIDU_AK 未设置，请在 .env 文件中配置")
 
 def get_location_info(address: str):
     """
